@@ -154,8 +154,11 @@ typedef struct {
     Packet          slots[MAX_SHARED_QUEUE];
     int             head, tail, count;
     pthread_mutex_t mutex;
-    sem_t           sem_slots;   /* producer waits here when full  */
-    sem_t           sem_items;   /* consumer waits here when empty */
+    sem_t           sem_slots;      /* producer waits here when full  */
+    sem_t           sem_items;      /* consumer waits here when empty */
+    /* condvar used by relay thread — AP workers signal after producing */
+    pthread_mutex_t relay_mutex;
+    pthread_cond_t  relay_cond;
 } SharedQueue;
 
 /*
@@ -170,16 +173,27 @@ typedef struct {
 
 /*
  * APWorker  —  one pthread per Access Point.
+ * See work_ready condvar comment in the struct below.
+ */
+/*
+ * work_ready — condition variable paired with sched_mutex.
  *
- * Each tick the thread:
- *   1. Locks sched_mutex.
- *   2. Pops the highest-priority client from the heap.
- *   3. Dequeues a packet from that client's tx_queue (also locked).
- *   4. "Transmits" it: pushes to outbound SharedQueue → relay thread.
- *   5. Unlocks and sleeps AP_TICK_US microseconds.
+ * AP worker thread calls:
+ *   pthread_mutex_lock(&sched_mutex)
+ *   while (scheduler.size == 0 && !stop)
+ *       pthread_cond_wait(&work_ready, &sched_mutex)  ← sleeps, releases mutex
+ *   ... do work ...
+ *   pthread_mutex_unlock(&sched_mutex)
  *
- * The atomic_int stop flag is the thread-safe shutdown signal —
- * set by the main thread, read by the worker without a lock.
+ * Generator thread calls, after inserting a client into the heap:
+ *   pthread_cond_signal(&work_ready)   ← wakes the AP worker
+ *
+ * pthread_cond_wait atomically releases sched_mutex and sleeps,
+ * so there is no window where a signal can be missed between the
+ * "heap is empty" check and the sleep.
+ *
+ * On shutdown: ap_worker_stop() calls pthread_cond_broadcast()
+ * so the worker wakes, sees stop==1, and exits cleanly.
  */
 typedef struct {
     int              ap_id;
@@ -187,6 +201,7 @@ typedef struct {
     Client          *clients[MAX_CLIENTS];
     int              client_count;
     pthread_mutex_t  sched_mutex;
+    pthread_cond_t   work_ready;     /* signalled when heap becomes non-empty */
     Scheduler        scheduler;
     SharedQueue     *outbound;
     SafeLog         *slog;
@@ -224,13 +239,27 @@ typedef struct {
  * on the AP graph to decide whether to "roam" a packet to a
  * neighbouring AP (simulating 802.11r fast BSS transition).
  */
+/*
+ * relay_cond — condition variable that wakes the relay thread.
+ *
+ * AP worker signals relay_cond after successfully producing a packet
+ * to the outbound SharedQueue.  Relay thread waits on it when all
+ * AP outbound queues are empty, avoiding a busy RELAY_TICK_US poll.
+ *
+ * relay_mutex is a dedicated lightweight mutex just for the condvar —
+ * it does NOT protect the SharedQueue itself (that uses its own mutex
+ * + semaphores); it only serialises the "is there anything to relay?"
+ * check so that pthread_cond_wait can be used correctly.
+ */
 typedef struct {
-    APWorker    *workers;
-    int          worker_count;
-    APGraph     *graph;
-    SafeLog     *slog;
-    atomic_int   stop;
-    pthread_t    tid;
+    APWorker        *workers;
+    int              worker_count;
+    APGraph         *graph;
+    SafeLog         *slog;
+    atomic_int       stop;
+    pthread_t        tid;
+    /* relay_mutex and relay_cond live on SharedQueue (outbound),
+     * so all AP workers can signal the same relay thread via one condvar */
     atomic_uint_fast64_t packets_relayed;
 } RelayCtx;
 

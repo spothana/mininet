@@ -29,8 +29,10 @@
 void sq_init(SharedQueue *sq) {
     sq->head = sq->tail = sq->count = 0;
     pthread_mutex_init(&sq->mutex, NULL);
-    sem_init(&sq->sem_slots, 0, MAX_SHARED_QUEUE); /* all slots free */
-    sem_init(&sq->sem_items, 0, 0);                /* nothing ready  */
+    sem_init(&sq->sem_slots, 0, MAX_SHARED_QUEUE);
+    sem_init(&sq->sem_items, 0, 0);
+    pthread_mutex_init(&sq->relay_mutex, NULL);
+    pthread_cond_init(&sq->relay_cond, NULL);
 }
 
 /* Blocking produce: waits if queue is full */
@@ -83,4 +85,6 @@ void sq_destroy(SharedQueue *sq) {
     pthread_mutex_destroy(&sq->mutex);
     sem_destroy(&sq->sem_slots);
     sem_destroy(&sq->sem_items);
+    pthread_cond_destroy(&sq->relay_cond);
+    pthread_mutex_destroy(&sq->relay_mutex);
 }
