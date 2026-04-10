@@ -81,3 +81,38 @@ void bst_free(RouteNode *root) {
     bst_free(root->right);
     free(root);
 }
+
+/* ---- Thread-safe RouteTable wrapper ---- */
+void rt_init(RouteTable *rt) {
+    rt->root = NULL;
+    pthread_mutex_init(&rt->mutex, NULL);
+}
+void rt_insert(RouteTable *rt, const char *ip, const uint8_t mac[6]) {
+    pthread_mutex_lock(&rt->mutex);
+    rt->root = bst_insert(rt->root, ip, mac);
+    pthread_mutex_unlock(&rt->mutex);
+}
+RouteNode *rt_search(RouteTable *rt, const char *ip) {
+    pthread_mutex_lock(&rt->mutex);
+    RouteNode *n = bst_search(rt->root, ip);
+    pthread_mutex_unlock(&rt->mutex);
+    return n;
+}
+void rt_delete(RouteTable *rt, const char *ip) {
+    pthread_mutex_lock(&rt->mutex);
+    rt->root = bst_delete(rt->root, ip);
+    pthread_mutex_unlock(&rt->mutex);
+}
+void rt_print(RouteTable *rt) {
+    pthread_mutex_lock(&rt->mutex);
+    printf("RouteTable (BST in-order):\n");
+    bst_inorder(rt->root);
+    pthread_mutex_unlock(&rt->mutex);
+}
+void rt_free(RouteTable *rt) {
+    pthread_mutex_lock(&rt->mutex);
+    bst_free(rt->root);
+    rt->root = NULL;
+    pthread_mutex_unlock(&rt->mutex);
+    pthread_mutex_destroy(&rt->mutex);
+}

@@ -1,7 +1,7 @@
 # MiniNet — WiFi Network Simulator in C
 
 A complete C project that exercises every fundamental data structure
-through the lens of a real WiFi driver / embedded networking system
+through the lens of a real WiFi driver / embedded networking system.
 
 ---
 

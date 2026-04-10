@@ -107,8 +107,8 @@ static void test_client_table(void) {
     uint8_t mac1[6] = {0x11,0x22,0x33,0x44,0x55,0x66};
     uint8_t mac2[6] = {0xAA,0xBB,0xCC,0xDD,0xEE,0xFF};
 
-    Client *c1 = client_new(mac1, "10.0.0.1", "DevA", -50, 5, BAND_5G, 36);
-    Client *c2 = client_new(mac2, "10.0.0.2", "DevB", -60, 3, BAND_2G,  6);
+    Client *c1 = client_new(mac1, "10.0.0.1", "DevA", -50, 5, BAND_5G, 36, 0);
+    Client *c2 = client_new(mac2, "10.0.0.2", "DevB", -60, 3, BAND_2G, 6, 0);
 
     CHECK(ct_insert(&ct, c1) == 0, "insert c1 ok");
     CHECK(ct_insert(&ct, c2) == 0, "insert c2 ok");
@@ -162,9 +162,9 @@ static void test_scheduler(void) {
 
     uint8_t m1[6]={0x01}, m2[6]={0x02}, m3[6]={0x03};
     /* signal: -40 prio:5, -70 prio:9, -55 prio:3 */
-    Client *a = client_new(m1, "1.1.1.1", "Alpha", -40, 5, BAND_5G, 36);
-    Client *b = client_new(m2, "1.1.1.2", "Beta",  -70, 9, BAND_5G, 36);
-    Client *c = client_new(m3, "1.1.1.3", "Gamma", -55, 3, BAND_5G, 36);
+    Client *a = client_new(m1, "1.1.1.1", "Alpha", -40, 5, BAND_5G, 36, 0);
+    Client *b = client_new(m2, "1.1.1.2", "Beta", -70, 9, BAND_5G, 36, 0);
+    Client *c = client_new(m3, "1.1.1.3", "Gamma", -55, 3, BAND_5G, 36, 0);
 
     sched_insert(&s, a);
     sched_insert(&s, b);

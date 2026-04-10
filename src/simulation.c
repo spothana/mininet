@@ -93,12 +93,12 @@ void sim_run(void) {
     uint8_t mac_laptop[6]   = {0xCA,0xFE,0xBA,0xBE,0x00,0x01};
     uint8_t mac_iot[6]      = {0x10,0x20,0x30,0x40,0x50,0x60};
 
-    Client *cp  = client_new(mac_carplay, "192.168.1.10", "iPhone-CarPlay",    -42, 9, BAND_5G, 36);
-    Client *aa  = client_new(mac_andauto, "192.168.1.11", "Pixel-AndroidAuto", -48, 8, BAND_5G, 36);
-    Client *tab = client_new(mac_tablet,  "192.168.1.20", "iPad-Tablet",       -61, 5, BAND_5G, 40);
-    Client *ph  = client_new(mac_phone,   "192.168.1.21", "Samsung-Phone",     -72, 4, BAND_2G,  6);
-    Client *lap = client_new(mac_laptop,  "192.168.1.30", "MacBook-Laptop",    -55, 6, BAND_6G,  1);
-    Client *iot = client_new(mac_iot,     "192.168.1.40", "ESP32-IoT",         -80, 1, BAND_2G,  6);
+    Client *cp  = client_new(mac_carplay, "192.168.1.10", "iPhone-CarPlay", -42, 9, BAND_5G, 36, 0);
+    Client *aa  = client_new(mac_andauto, "192.168.1.11", "Pixel-AndroidAuto", -48, 8, BAND_5G, 36, 0);
+    Client *tab = client_new(mac_tablet, "192.168.1.20", "iPad-Tablet", -61, 5, BAND_5G, 40, 0);
+    Client *ph  = client_new(mac_phone, "192.168.1.21", "Samsung-Phone", -72, 4, BAND_2G, 6, 0);
+    Client *lap = client_new(mac_laptop, "192.168.1.30", "MacBook-Laptop", -55, 6, BAND_6G, 1, 0);
+    Client *iot = client_new(mac_iot, "192.168.1.40", "ESP32-IoT", -80, 1, BAND_2G, 6, 0);
 
     ct_insert(&ct, cp);
     ct_insert(&ct, aa);

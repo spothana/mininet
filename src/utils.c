@@ -34,3 +34,8 @@ void print_mac(const uint8_t mac[6]) {
 int ip_cmp(const char *a, const char *b) {
     return strcmp(a, b);
 }
+
+void sleep_us(long us) {
+    struct timespec ts = { .tv_sec = us / 1000000L, .tv_nsec = (us % 1000000L) * 1000L };
+    nanosleep(&ts, NULL);
+}

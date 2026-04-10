@@ -20,7 +20,7 @@ uint32_t mac_hash(const uint8_t mac[6]) {
 /* Allocate and initialise a new Client */
 Client *client_new(const uint8_t mac[6], const char *ip,
                    const char *name, int signal, int priority,
-                   Band band, int channel) {
+                   Band band, int channel, int ap_id) {
     Client *c = calloc(1, sizeof(Client));
     if (!c) return NULL;
     memcpy(c->mac, mac, 6);
@@ -30,6 +30,8 @@ Client *client_new(const uint8_t mac[6], const char *ip,
     c->priority   = priority;
     c->band       = band;
     c->channel    = channel;
+    c->ap_id      = ap_id;
+    pthread_mutex_init(&c->tx_mutex, NULL);
     rb_init(&c->tx_ring);
     pq_init(&c->tx_queue);
     rs_init(&c->retry_stack);
@@ -40,6 +42,7 @@ Client *client_new(const uint8_t mac[6], const char *ip,
 void ct_init(ClientTable *ct) {
     memset(ct->buckets, 0, sizeof(ct->buckets));
     ct->count = 0;
+    pthread_mutex_init(&ct->mutex, NULL);
 }
 
 /* Insert; returns 0 ok, -1 duplicate or error */
@@ -79,6 +82,7 @@ int ct_remove(ClientTable *ct, const uint8_t mac[6]) {
             else      ct->buckets[idx] = cur->next;
             pq_free(&cur->tx_queue);
             rs_free(&cur->retry_stack);
+            pthread_mutex_destroy(&cur->tx_mutex);
             free(cur);
             ct->count--;
             return 0;
@@ -123,6 +127,7 @@ void ct_free(ClientTable *ct) {
             Client *nxt = cur->next;
             pq_free(&cur->tx_queue);
             rs_free(&cur->retry_stack);
+            pthread_mutex_destroy(&cur->tx_mutex);
             free(cur);
             cur = nxt;
         }
