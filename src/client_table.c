@@ -33,6 +33,9 @@ Client *client_new(const uint8_t mac[6], const char *ip,
     c->ap_id      = ap_id;
     pthread_mutex_init(&c->tx_mutex, NULL);
     rb_init(&c->tx_ring);
+    rb_init(&c->rx_ring);
+    pthread_mutex_init(&c->rx_mutex, NULL);
+    pthread_cond_init(&c->rx_ready, NULL);
     pq_init(&c->tx_queue);
     rs_init(&c->retry_stack);
     c->next = NULL;
@@ -83,6 +86,8 @@ int ct_remove(ClientTable *ct, const uint8_t mac[6]) {
             pq_free(&cur->tx_queue);
             rs_free(&cur->retry_stack);
             pthread_mutex_destroy(&cur->tx_mutex);
+            pthread_cond_destroy(&cur->rx_ready);
+            pthread_mutex_destroy(&cur->rx_mutex);
             free(cur);
             ct->count--;
             return 0;
@@ -128,6 +133,8 @@ void ct_free(ClientTable *ct) {
             pq_free(&cur->tx_queue);
             rs_free(&cur->retry_stack);
             pthread_mutex_destroy(&cur->tx_mutex);
+            pthread_cond_destroy(&cur->rx_ready);
+            pthread_mutex_destroy(&cur->rx_mutex);
             free(cur);
             cur = nxt;
         }

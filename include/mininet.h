@@ -74,12 +74,19 @@ typedef struct Client {
     Band            band;
     int             channel;
     int             ap_id;
-    RingBuffer      tx_ring;
-    PacketQueue     tx_queue;
-    RetryStack      retry_stack;
-    pthread_mutex_t tx_mutex;     /* guards tx_ring + tx_queue */
+    /* TX path: generator → tx_queue → AP worker → outbound SharedQueue */
+    RingBuffer      tx_ring;          /* DMA-style TX descriptor ring   */
+    PacketQueue     tx_queue;         /* software TX FIFO               */
+    RetryStack      retry_stack;      /* CSMA/CA retry backoff          */
+    pthread_mutex_t tx_mutex;         /* guards tx_ring + tx_queue      */
+    /* RX path: rx_queue (APWorker) → rx_ring per client                */
+    RingBuffer      rx_ring;          /* DMA-style RX descriptor ring   */
+    pthread_mutex_t rx_mutex;         /* guards rx_ring                 */
+    pthread_cond_t  rx_ready;         /* signalled when rx_ring has data*/
     uint64_t        bytes_sent;
+    uint64_t        bytes_received;
     uint64_t        bytes_dropped;
+    uint64_t        packets_rx;
     struct Client  *next;
 } Client;
 
@@ -203,11 +210,15 @@ typedef struct {
     pthread_mutex_t  sched_mutex;
     pthread_cond_t   work_ready;     /* signalled when heap becomes non-empty */
     Scheduler        scheduler;
-    SharedQueue     *outbound;
+    SharedQueue     *outbound;       /* TX path: AP → relay              */
+    SharedQueue      rx_queue;       /* RX path: relay → AP → clients
+                                      * relay pushes here; AP worker
+                                      * drains and dispatches to clients  */
     SafeLog         *slog;
     atomic_int       stop;
     pthread_t        tid;
     atomic_uint_fast64_t packets_tx;
+    atomic_uint_fast64_t packets_rx;
     atomic_uint_fast64_t packets_dropped;
 } APWorker;
 
@@ -357,6 +368,40 @@ void sq_consume(SharedQueue *sq, Packet *out);
 int  sq_try_consume(SharedQueue *sq, Packet *out);
 void sq_destroy(SharedQueue *sq);
 
+/*
+ * ReceiverCtx  —  one RX-dispatch pthread per simulation.
+ *
+ * Drains each APWorker's rx_queue.  For each inbound packet:
+ *   1. Look up the destination MAC in the ClientTable (hash lookup).
+ *   2. Lock client->rx_mutex.
+ *   3. rb_push() into client->rx_ring (DMA-style RX descriptor ring).
+ *   4. pthread_cond_signal(&client->rx_ready) to wake any thread
+ *      waiting to consume received frames (models NAPI / softirq).
+ *   5. Unlock rx_mutex.
+ *   6. Update client->bytes_received and packets_rx stats.
+ *
+ * Using a per-client rx_ring (fixed circular buffer) here — not a
+ * linked list — matches how real WiFi drivers fill RX descriptor
+ * rings that the OS then drains via NAPI polling.
+ *
+ * rx_ready condvar: any consumer thread (not modelled here, but the
+ * hook is correct) would do:
+ *   pthread_mutex_lock(&c->rx_mutex)
+ *   while (rb_is_empty(&c->rx_ring)) pthread_cond_wait(&c->rx_ready, &c->rx_mutex)
+ *   rb_pop(&c->rx_ring, &pkt)
+ *   pthread_mutex_unlock(&c->rx_mutex)
+ */
+typedef struct {
+    APWorker       *workers;
+    int             worker_count;
+    ClientTable    *ct;             /* for MAC→Client lookup           */
+    SafeLog        *slog;
+    atomic_int      stop;
+    pthread_t       tid;
+    atomic_uint_fast64_t packets_dispatched;
+    atomic_uint_fast64_t packets_unknown;   /* no client found for MAC */
+} ReceiverCtx;
+
 /* threaded_sim.c */
 void ap_worker_init(APWorker *w, int ap_id, AccessPoint *ap,
                     SharedQueue *outbound, SafeLog *slog);
@@ -367,6 +412,8 @@ void generator_start(GeneratorCtx *g);
 void generator_stop(GeneratorCtx *g);
 void relay_start(RelayCtx *r);
 void relay_stop(RelayCtx *r);
+void receiver_start(ReceiverCtx *rx);
+void receiver_stop(ReceiverCtx *rx);
 
 /* simulation.c */
 void sim_run(void);
