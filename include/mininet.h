@@ -415,8 +415,263 @@ void relay_stop(RelayCtx *r);
 void receiver_start(ReceiverCtx *rx);
 void receiver_stop(ReceiverCtx *rx);
 
+
+/* =========================================================
+ *  LOCKLESS / MULTI-CORE LAYER  (Part 3)
+ *
+ *  Design goals:
+ *    - Zero mutex acquisitions on the packet hot path
+ *    - Each AP worker pinned to its own CPU core
+ *    - Per-core counters padded to avoid false sharing
+ *    - SPSC ring for client TX/RX (one producer, one consumer)
+ *    - MPSC queue for generator → AP worker (many producers,
+ *      one consumer) using CAS on the tail pointer
+ *    - RCU-style hash table for ClientTable reads (no lock
+ *      on lookup; writer does copy-then-atomic-swap)
+ * ========================================================= */
+
+/* ---- Cache line size and padding ---- */
+#define CACHE_LINE_SIZE   64
+
+/*
+ * AlignedCounter  —  one atomic counter padded to a full cache line.
+ *
+ * Without padding, two counters for different cores sit adjacent in
+ * memory and share a 64-byte cache line.  When core 0 writes its
+ * counter the hardware broadcasts a cache-invalidation to every other
+ * core that holds that line — even though they never touch core 0's
+ * word.  This is false sharing and can be slower than a mutex.
+ *
+ * Padding guarantees each counter occupies exactly one cache line,
+ * so writes by different cores never invalidate each other's lines.
+ */
+typedef struct {
+    atomic_uint_fast64_t value;
+    char _pad[CACHE_LINE_SIZE - sizeof(atomic_uint_fast64_t)];
+} AlignedCounter;
+
+/* =========================================================
+ *  SPSC Ring Buffer  (Single Producer, Single Consumer)
+ *
+ *  Lock-free because producer and consumer own separate
+ *  index variables and only read (never write) each other's:
+ *
+ *    Producer owns:  tail  (writes tail, reads head)
+ *    Consumer owns:  head  (writes head, reads tail)
+ *
+ *  Both are atomic so the cross-reads are data-race-free.
+ *  No mutex, no semaphore — a single store-release / load-acquire
+ *  pair provides the necessary memory ordering.
+ *
+ *  Use case in MiniNet:
+ *    - Generator thread  → SPSC → AP worker   (TX path per client)
+ *    - Relay thread      → SPSC → Receiver    (RX path per client)
+ *
+ *  Capacity must be a power of two so (idx & mask) replaces (idx % N).
+ * ========================================================= */
+#define SPSC_CAP   32          /* must be power of two */
+#define SPSC_MASK  (SPSC_CAP - 1)
+
+typedef struct {
+    /* Producer cache line */
+    atomic_uint_fast32_t tail;
+    char _pad0[CACHE_LINE_SIZE - sizeof(atomic_uint_fast32_t)];
+    /* Consumer cache line */
+    atomic_uint_fast32_t head;
+    char _pad1[CACHE_LINE_SIZE - sizeof(atomic_uint_fast32_t)];
+    /* Data — separate to avoid false sharing with indices */
+    Packet slots[SPSC_CAP];
+} SpscRing;
+
+/* =========================================================
+ *  MPSC Queue  (Multi Producer, Single Consumer)
+ *
+ *  Many generator threads push; one AP worker pops.
+ *
+ *  Algorithm (intrusive linked list, Dmitry Vyukov MPSC):
+ *    Push (any thread, CAS-free on modern hardware with
+ *          fetch_and_store / atomic_exchange):
+ *      node->next = NULL
+ *      prev = atomic_exchange(&tail, node)   <- serialises producers
+ *      prev->next = node                     <- visible after exchange
+ *
+ *    Pop (consumer only — no CAS needed):
+ *      head = head->next
+ *      if head == NULL → empty
+ *
+ *  The stub node (sentinel) makes the empty-queue case clean.
+ *  One allocation per packet (node), freed by consumer.
+ * ========================================================= */
+typedef struct MpscNode {
+    Packet            pkt;
+    _Atomic(struct MpscNode *) next;
+} MpscNode;
+
+typedef struct {
+    /* tail — written by producers (atomic_exchange) */
+    _Atomic(MpscNode *) tail;
+    char _pad0[CACHE_LINE_SIZE - sizeof(_Atomic(MpscNode *))];
+    /* head — owned exclusively by consumer (no atomic needed) */
+    MpscNode           *head;
+    char _pad1[CACHE_LINE_SIZE - sizeof(MpscNode *)];
+    MpscNode            stub;   /* sentinel — always at list head init */
+} MpscQueue;
+
+/* =========================================================
+ *  RCU Hash Table  (Read-Copy-Update for ClientTable)
+ *
+ *  Readers:  no lock at all — just load the atomic pointer
+ *            and use it.  Even if a writer swaps the pointer
+ *            mid-read, the reader holds a valid reference to
+ *            the old table until it "announces" it has finished
+ *            (epoch-based reclaim, simplified here with a
+ *            two-version double-buffer).
+ *
+ *  Writers:  allocate a new RcuBucket array, copy all entries,
+ *            apply the update, then:
+ *              atomic_store(&table->buckets, new_ptr, release)
+ *            Wait for all readers to pass through a quiescent
+ *            point (here: a small sleep is sufficient for our
+ *            simulation), then free the old array.
+ *
+ *  This gives O(1) reads with zero synchronisation on the
+ *  lookup hot path — exactly what cfg80211's station table
+ *  does in the Linux kernel.
+ * ========================================================= */
+#define RCU_BUCKETS   64
+
+typedef struct RcuEntry {
+    uint8_t           mac[6];
+    char              name[32];
+    char              ip[16];
+    int               ap_id;
+    int               signal_dbm;
+    struct RcuEntry  *next;        /* hash chain (plain pointer — single writer) */
+} RcuEntry;
+
+typedef struct {
+    RcuEntry *chains[RCU_BUCKETS]; /* one chain per bucket */
+} RcuBucketArray;
+
+typedef struct {
+    _Atomic(RcuBucketArray *) buckets;  /* readers load this atomically    */
+    pthread_mutex_t            write_lock; /* serialises concurrent writers  */
+    int                        count;
+} RcuTable;
+
+/* =========================================================
+ *  Per-core AP worker (lockless version)
+ *
+ *  Differences from APWorker:
+ *    - Pinned to cpu_id via pthread_setaffinity_np
+ *    - Uses SpscRing per client instead of PacketQueue+mutex
+ *    - Consumes from MpscQueue (generator pushes here)
+ *    - Stats in AlignedCounter (no false sharing)
+ *    - No sched_mutex — scheduler heap is thread-local
+ *    - No work_ready condvar — spins with sched_yield()
+ *      on the SPSC tail (appropriate for pinned cores)
+ * ========================================================= */
+#define MAX_LOCKLESS_CLIENTS  16
+
+typedef struct {
+    int          ap_id;
+    int          cpu_id;          /* pinned core                   */
+    AccessPoint *ap;
+    /* per-client SPSC rings (TX direction: gen→worker) */
+    SpscRing    *tx_rings[MAX_LOCKLESS_CLIENTS];
+    /* per-client SPSC rings (RX direction: relay→client) */
+    SpscRing    *rx_rings[MAX_LOCKLESS_CLIENTS];
+    /* client metadata (read-only after setup) */
+    char         client_names[MAX_LOCKLESS_CLIENTS][32];
+    uint8_t      client_macs[MAX_LOCKLESS_CLIENTS][6];
+    int          client_count;
+    /* MPSC queue: multiple generator threads → this worker */
+    MpscQueue    mpsc_in;
+    /* outbound SPSC to relay (worker is sole producer) */
+    SpscRing     relay_ring;
+    /* scheduler heap — thread-local, no lock needed */
+    Scheduler    scheduler;
+    /* RCU table reference (read-only pointer) */
+    RcuTable    *rcu_ct;
+    SafeLog     *slog;
+    atomic_int   stop;
+    pthread_t    tid;
+    /* False-sharing-free per-core counters */
+    AlignedCounter packets_tx;
+    AlignedCounter packets_rx;
+    AlignedCounter packets_dropped;
+} LocklessAP;
+
+/* =========================================================
+ *  Lockless generator context
+ *
+ *  Uses atomic seq counter (same as before) but pushes via
+ *  MPSC queue instead of locking tx_mutex + PacketQueue.
+ * ========================================================= */
+typedef struct {
+    LocklessAP  *workers;
+    int          worker_count;
+    SafeLog     *slog;
+    atomic_int   stop;
+    atomic_uint  seq_counter;
+    pthread_t    tid;
+} LocklessGen;
+
+/* =========================================================
+ *  Lockless relay context
+ *
+ *  Drains each AP's relay_ring (SPSC — relay is sole consumer).
+ *  Pushes downlink frames into per-client rx_rings (SPSC —
+ *  relay is sole producer per client ring).
+ *  BFS roaming same as before.
+ * ========================================================= */
+typedef struct {
+    LocklessAP  *workers;
+    int          worker_count;
+    APGraph     *graph;
+    RcuTable    *rcu_ct;
+    SafeLog     *slog;
+    atomic_int   stop;
+    pthread_t    tid;
+    AlignedCounter packets_relayed;
+} LocklessRelay;
+
+/* lockless_sim.c prototypes */
+void spsc_init(SpscRing *r);
+int  spsc_push(SpscRing *r, const Packet *pkt);  /* producer   */
+int  spsc_pop (SpscRing *r, Packet *out);         /* consumer   */
+int  spsc_empty(const SpscRing *r);
+
+void mpsc_init(MpscQueue *q);
+void mpsc_push(MpscQueue *q, const Packet *pkt); /* any thread */
+int  mpsc_pop (MpscQueue *q, Packet *out);        /* consumer   */
+void mpsc_drain(MpscQueue *q);
+
+void rcu_table_init(RcuTable *t);
+void rcu_table_insert(RcuTable *t, const uint8_t mac[6],
+                      const char *name, const char *ip,
+                      int ap_id, int signal_dbm);
+RcuEntry *rcu_table_lookup(RcuTable *t, const uint8_t mac[6]);
+void rcu_table_free(RcuTable *t);
+
+void lockless_ap_init(LocklessAP *w, int ap_id, int cpu_id,
+                      AccessPoint *ap, RcuTable *rcu_ct, SafeLog *slog);
+void lockless_ap_add_client(LocklessAP *w, const uint8_t mac[6],
+                             const char *name, SpscRing *tx, SpscRing *rx);
+void lockless_ap_start(LocklessAP *w);
+void lockless_ap_stop(LocklessAP *w);
+
+void lockless_gen_start(LocklessGen *g);
+void lockless_gen_stop(LocklessGen *g);
+
+void lockless_relay_start(LocklessRelay *r);
+void lockless_relay_stop(LocklessRelay *r);
+
+void sim_run_lockless(void);
+
 /* simulation.c */
 void sim_run(void);
 void sim_run_threaded(void);
+void sim_run_lockless(void);
 
 #endif /* MININET_H */

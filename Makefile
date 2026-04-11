@@ -1,4 +1,3 @@
-# MiniNet Makefile
 CC      = gcc
 CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -Iinclude -g \
           -D_POSIX_C_SOURCE=200809L -pthread
@@ -15,7 +14,12 @@ SRCS    = src/utils.c \
           src/safe_log.c \
           src/shared_queue.c \
           src/simulation.c \
-          src/threaded_sim.c
+          src/threaded_sim.c \
+          src/spsc_ring.c \
+          src/mpsc_queue.c \
+          src/rcu_table.c \
+          src/cpu_affinity.c \
+          src/lockless_sim.c
 
 OBJS        = $(SRCS:.c=.o)
 TARGET      = mininet
